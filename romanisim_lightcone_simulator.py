@@ -39,7 +39,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Render ideal GalSim truth images and wrap them into Romanisim L1/L2 products."
     )
-    parser.add_argument("catalog", type=Path, help="Input catalog for roman_galsim_simulator.py.")
+    parser.add_argument(
+        "catalog",
+        type=Path,
+        nargs="+",
+        help="Input catalog(s) for roman_galsim_simulator.py.",
+    )
     parser.add_argument("--catalog-format", default="auto", choices=("auto", "csv", "table", "lightcone"))
     parser.add_argument("--output-dir", type=Path, default=Path("romanisim_output"))
     parser.add_argument("--truth-dir", type=Path, default=Path("romanisim_output/truth"))
@@ -143,7 +148,7 @@ def make_truth_images(args: argparse.Namespace) -> None:
     command = [
         sys.executable,
         str(script),
-        str(args.catalog),
+        *[str(path) for path in args.catalog],
         "--catalog-format",
         args.catalog_format,
         "--output-dir",

@@ -72,7 +72,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate ideal Roman WFI detector images from a morphology catalog."
     )
-    parser.add_argument("catalog", type=Path, help="Input catalog: CSV, ECSV, FITS, ASCII, or lightcone.dat.")
+    parser.add_argument(
+        "catalog",
+        type=Path,
+        nargs="+",
+        help="Input catalog(s): CSV, ECSV, FITS, ASCII, or one or more lightcone.dat files.",
+    )
     parser.add_argument(
         "--catalog-format",
         choices=("auto", "csv", "table", "lightcone"),
@@ -280,7 +285,7 @@ def read_lightcone_catalog(path: Path, show_progress: bool) -> List[MutableMappi
     return rows
 
 
-def read_catalog(path: Path, catalog_format: str, show_progress: bool) -> List[MutableMapping[str, object]]:
+def read_one_catalog(path: Path, catalog_format: str, show_progress: bool) -> List[MutableMapping[str, object]]:
     if catalog_format == "auto":
         catalog_format = detect_catalog_format(path)
     if catalog_format == "csv":
@@ -294,6 +299,15 @@ def read_catalog(path: Path, catalog_format: str, show_progress: bool) -> List[M
     raise RuntimeError(
         "Only CSV and lightcone .dat input are supported without astropy. Install astropy for FITS/ECSV catalogs."
     )
+
+
+def read_catalogs(paths: Sequence[Path], catalog_format: str, show_progress: bool) -> List[MutableMapping[str, object]]:
+    rows: List[MutableMapping[str, object]] = []
+    for path in paths:
+        print(f"Reading catalog {path}...", flush=True)
+        rows.extend(read_one_catalog(path, catalog_format, show_progress=show_progress))
+    print(f"Read {len(rows)} total catalog rows from {len(paths)} file(s).", flush=True)
+    return rows
 
 
 def normalize_catalog_row(row: Mapping[str, object]) -> Dict[str, object]:
@@ -747,7 +761,7 @@ def render_filter_image(
 
 def main() -> None:
     args = parse_args()
-    rows = read_catalog(args.catalog, args.catalog_format, show_progress=args.progress)
+    rows = read_catalogs(args.catalog, args.catalog_format, show_progress=args.progress)
     pointing = galsim.CelestialCoord(args.pointing_ra * galsim.degrees, args.pointing_dec * galsim.degrees)
     date = dt.datetime.fromisoformat(args.date)
     filters = [canonical_band_name(band) for band in args.filters]

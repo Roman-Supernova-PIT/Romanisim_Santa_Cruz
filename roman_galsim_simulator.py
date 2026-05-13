@@ -61,6 +61,20 @@ ROMAN_LIGHTCONE_MAG_COLUMNS = {
     "F184": "Roman_F184",
     "K213": "Roman_F213",
 }
+LIGHTCONE_REQUIRED_COLUMNS = {
+    "halo_id_nbody",
+    "gal_id",
+    "z_nopec",
+    "redshift",
+    "ra",
+    "dec",
+    "r_disk",
+    "rbulge",
+    "mstar",
+    "mbulge",
+    "cosi",
+    *ROMAN_LIGHTCONE_MAG_COLUMNS.values(),
+}
 CANONICAL_TO_ALIASES: Dict[str, Tuple[str, ...]] = {}
 for canonical in sorted(set(FILTER_ALIASES.values())):
     CANONICAL_TO_ALIASES[canonical] = tuple(
@@ -268,6 +282,14 @@ def count_data_rows(path: Path) -> int:
 
 def read_lightcone_catalog(path: Path, show_progress: bool) -> List[MutableMapping[str, object]]:
     columns = parse_lightcone_header(path)
+    keep_indices = [
+        (idx, name)
+        for idx, name in enumerate(columns)
+        if name in LIGHTCONE_REQUIRED_COLUMNS
+    ]
+    missing = sorted(LIGHTCONE_REQUIRED_COLUMNS.difference(columns))
+    if missing:
+        print(f"Warning: {path} is missing lightcone columns: {', '.join(missing)}", flush=True)
     if show_progress:
         print(f"Counting rows in {path}...", flush=True)
     total_rows = count_data_rows(path) if show_progress else None
@@ -278,8 +300,9 @@ def read_lightcone_catalog(path: Path, show_progress: bool) -> List[MutableMappi
             stripped = line.strip()
             values = stripped.split()
             row = {
-                columns[idx] if idx < len(columns) else f"col{idx}": value
-                for idx, value in enumerate(values)
+                name: values[idx]
+                for idx, name in keep_indices
+                if idx < len(values)
             }
             rows.append(row)
     return rows

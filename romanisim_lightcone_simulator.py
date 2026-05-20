@@ -58,6 +58,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disk-knot-fraction", type=float, default=0.2)
     parser.add_argument("--disk-knot-count", type=int, default=20)
     parser.add_argument("--disk-knot-radius-scale", type=float, default=0.8)
+    parser.add_argument("--render-mode", choices=("achromatic", "chromatic"), default="achromatic")
+    parser.add_argument("--psf-mode", choices=("achromatic", "chromatic", "none"), default="achromatic")
+    parser.add_argument("--max-draw-objects", type=int, default=None)
+    parser.add_argument("--max-mag", type=float, default=None)
     parser.add_argument("--level", type=int, default=1, choices=(1, 2), help="Romanisim output level.")
     parser.add_argument("--ma-table-number", type=int, default=None)
     parser.add_argument("--rng-seed", type=int, default=12345)
@@ -173,7 +177,15 @@ def make_truth_images(args: argparse.Namespace) -> None:
         str(args.disk_knot_count),
         "--disk-knot-radius-scale",
         str(args.disk_knot_radius_scale),
+        "--render-mode",
+        args.render_mode,
+        "--psf-mode",
+        args.psf_mode,
     ]
+    if args.max_draw_objects is not None:
+        command.extend(["--max-draw-objects", str(args.max_draw_objects)])
+    if args.max_mag is not None:
+        command.extend(["--max-mag", str(args.max_mag)])
     if args.verbose_footprint:
         command.append("--verbose-footprint")
     if args.no_progress:

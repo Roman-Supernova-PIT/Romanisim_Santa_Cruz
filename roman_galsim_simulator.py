@@ -147,6 +147,12 @@ def parse_args() -> argparse.Namespace:
         help="Skip PSF convolution and render intrinsic morphology only.",
     )
     parser.add_argument(
+        "--psf-mode",
+        choices=("achromatic", "chromatic", "none"),
+        default="achromatic",
+        help="Use an effective-wavelength Roman PSF, the full chromatic PSF, or no PSF.",
+    )
+    parser.add_argument(
         "--include-pixel",
         action="store_true",
         default=True,
@@ -191,6 +197,24 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.8,
         help="RandomKnots half-light radius as a fraction of the disk half-light radius.",
+    )
+    parser.add_argument(
+        "--render-mode",
+        choices=("achromatic", "chromatic"),
+        default="achromatic",
+        help="Use fast scalar-flux rendering per band, or slower chromatic SED rendering.",
+    )
+    parser.add_argument(
+        "--max-draw-objects",
+        type=int,
+        default=None,
+        help="Optional cap on the number of in-footprint objects drawn per band for quick tests.",
+    )
+    parser.add_argument(
+        "--max-mag",
+        type=float,
+        default=None,
+        help="Skip sources fainter than this magnitude in the rendered band.",
     )
     parser.add_argument(
         "--progress",
@@ -419,6 +443,16 @@ def magnitude_column_names(band: str, prefix: str) -> Sequence[str]:
     return tuple(ordered_names)
 
 
+def get_ab_flux_from_mag(mag: float, bandpass: galsim.Bandpass) -> float:
+    zeropoint = getattr(bandpass, "zeropoint", getattr(bandpass, "_zeropoint", None))
+    if zeropoint is not None:
+        return 10.0 ** (-0.4 * (mag - zeropoint)) * roman.collecting_area
+
+    sed = galsim.SED(lambda wave: 1.0, wave_type="nm", flux_type="fphotons")
+    sed = sed.withMagnitude(mag, bandpass) * roman.collecting_area
+    return sed.calculateFlux(bandpass)
+
+
 def physical_kpc_to_arcsec(size_kpc: float, redshift: float) -> float:
     if size_kpc <= 0.0:
         return 0.0
@@ -636,6 +670,15 @@ def get_psf(sca: int, band: str) -> galsim.GSObject:
         return roman.getPSF(SCA=sca, bandpass=canonical)
 
 
+def get_render_psf(sca: int, band: str, bandpass: galsim.Bandpass, psf_mode: str):
+    if psf_mode == "none":
+        return None
+    psf = get_psf(sca, band)
+    if psf_mode == "achromatic" and hasattr(psf, "evaluateAtWavelength"):
+        return psf.evaluateAtWavelength(bandpass.effective_wavelength)
+    return psf
+
+
 def point_is_on_sca(image_pos: galsim.PositionD, padding_pixels: float = 0.0) -> bool:
     low = 0.5 - padding_pixels
     high = ROMAN_NATIVE_NPIX + 0.5 + padding_pixels
@@ -651,17 +694,19 @@ def image_position_to_stamp(
     obj: galsim.GSObject,
     wcs: galsim.BaseWCS,
     image_pos: galsim.PositionD,
-    bandpass: galsim.Bandpass,
+    bandpass: Optional[galsim.Bandpass],
 ) -> galsim.Image:
     ix = int(math.floor(image_pos.x + 0.5))
     iy = int(math.floor(image_pos.y + 0.5))
     offset = galsim.PositionD(image_pos.x - ix, image_pos.y - iy)
-    stamp = obj.drawImage(
-        bandpass=bandpass,
-        wcs=wcs.local(image_pos),
-        method="no_pixel",
-        offset=offset,
-    )
+    draw_kwargs = {
+        "wcs": wcs.local(image_pos),
+        "method": "no_pixel",
+        "offset": offset,
+    }
+    if bandpass is not None:
+        draw_kwargs["bandpass"] = bandpass
+    stamp = obj.drawImage(**draw_kwargs)
     stamp.setCenter(ix, iy)
     return stamp
 
@@ -693,6 +738,7 @@ def render_filter_image(
     sca: int,
     include_psf: bool,
     include_pixel: bool,
+    psf_mode: str,
     mag_prefix: str,
     verbose_footprint: bool = False,
     show_progress: bool = True,
@@ -700,11 +746,18 @@ def render_filter_image(
     disk_knot_fraction: float = 0.2,
     disk_knot_count: int = 20,
     disk_knot_radius_scale: float = 0.8,
+    render_mode: str = "achromatic",
+    max_draw_objects: Optional[int] = None,
+    max_mag: Optional[float] = None,
 ) -> tuple[galsim.ImageF, Dict[str, object]]:
     image = galsim.ImageF(ROMAN_NATIVE_NPIX, ROMAN_NATIVE_NPIX, wcs=wcs)
     image.setOrigin(1, 1)
 
-    psf = get_psf(sca, band) if include_psf else None
+    active_psf_mode = psf_mode if include_psf else "none"
+    if active_psf_mode == "chromatic" and render_mode != "chromatic":
+        print("Warning: --psf-mode chromatic requires --render-mode chromatic; using achromatic PSF.", flush=True)
+        active_psf_mode = "achromatic"
+    psf = get_render_psf(sca, band, bandpass, active_psf_mode)
     pixel = galsim.Pixel(scale=roman.pixel_scale) if include_pixel else None
 
     n_with_mag = 0
@@ -718,6 +771,8 @@ def render_filter_image(
         row = normalize_catalog_row(raw_row)
         mag = maybe_float(optional_value(row, *magnitude_column_names(band, mag_prefix)))
         if mag is None:
+            continue
+        if max_mag is not None and mag > max_mag:
             continue
         n_with_mag += 1
 
@@ -733,6 +788,8 @@ def render_filter_image(
             continue
 
         on_sca_sources.append((idx, row, mag, image_pos))
+        if max_draw_objects is not None and len(on_sca_sources) >= max_draw_objects:
+            break
 
     draw_iter = progress_iter(
         on_sca_sources,
@@ -742,21 +799,32 @@ def render_filter_image(
     )
     for draw_idx, (_idx, row, mag, image_pos) in enumerate(draw_iter, start=1):
         progress_update(draw_idx, len(on_sca_sources), f"Drawing {band}", show_progress)
-        sed = galsim.SED(lambda wave: 1.0, wave_type="nm", flux_type="fphotons")
-        sed = sed.withMagnitude(mag, bandpass) * roman.collecting_area
-        obj = build_galaxy(
-            row,
-            1.0,
-            disk_knot_fraction=disk_knot_fraction,
-            disk_knot_count=disk_knot_count,
-            disk_knot_radius_scale=disk_knot_radius_scale,
-        ) * sed
+        if render_mode == "chromatic":
+            sed = galsim.SED(lambda wave: 1.0, wave_type="nm", flux_type="fphotons")
+            sed = sed.withMagnitude(mag, bandpass) * roman.collecting_area
+            obj = build_galaxy(
+                row,
+                1.0,
+                disk_knot_fraction=disk_knot_fraction,
+                disk_knot_count=disk_knot_count,
+                disk_knot_radius_scale=disk_knot_radius_scale,
+            ) * sed
+        else:
+            flux = get_ab_flux_from_mag(mag, bandpass)
+            obj = build_galaxy(
+                row,
+                flux,
+                disk_knot_fraction=disk_knot_fraction,
+                disk_knot_count=disk_knot_count,
+                disk_knot_radius_scale=disk_knot_radius_scale,
+            )
         if psf is not None:
             obj = galsim.Convolve(obj, psf)
         if pixel is not None:
             obj = galsim.Convolve(obj, pixel)
 
-        stamp = image_position_to_stamp(obj, wcs, image_pos, bandpass)
+        stamp_bandpass = bandpass if render_mode == "chromatic" or active_psf_mode == "chromatic" else None
+        stamp = image_position_to_stamp(obj, wcs, image_pos, stamp_bandpass)
         overlap = stamp.bounds & image.bounds
         if overlap.isDefined():
             image[overlap] += stamp[overlap]
@@ -770,6 +838,8 @@ def render_filter_image(
         "edge_padding_pixels": padding_pixels,
         "disk_knot_fraction": disk_knot_fraction,
         "disk_knot_count": disk_knot_count,
+        "render_mode": render_mode,
+        "psf_mode": active_psf_mode,
         "sample_positions": sample_positions,
     }
     if verbose_footprint:
@@ -805,6 +875,7 @@ def main() -> None:
             sca=args.sca,
             include_psf=args.include_psf,
             include_pixel=args.include_pixel,
+            psf_mode=args.psf_mode,
             mag_prefix=args.mag_prefix,
             verbose_footprint=args.verbose_footprint,
             show_progress=args.progress,
@@ -812,6 +883,9 @@ def main() -> None:
             disk_knot_fraction=args.disk_knot_fraction,
             disk_knot_count=args.disk_knot_count,
             disk_knot_radius_scale=args.disk_knot_radius_scale,
+            render_mode=args.render_mode,
+            max_draw_objects=args.max_draw_objects,
+            max_mag=args.max_mag,
         )
         metadata = {
             "filter": band,
@@ -826,6 +900,8 @@ def main() -> None:
             "edgpad": diagnostics["edge_padding_arcsec"],
             "knfrac": diagnostics["disk_knot_fraction"],
             "nknots": diagnostics["disk_knot_count"],
+            "rendmode": diagnostics["render_mode"],
+            "psfmode": diagnostics["psf_mode"],
             "psf": int(args.include_psf),
             "pixel": int(args.include_pixel),
         }

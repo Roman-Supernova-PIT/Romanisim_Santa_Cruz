@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -49,6 +50,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verbose-footprint", action="store_true")
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Write the dither table and print commands without running them.")
+    parser.add_argument("--write-sbatch", action="store_true", help="Write one Slurm sbatch script per exposure instead of running locally.")
+    parser.add_argument("--submit", action="store_true", help="Submit generated sbatch scripts with sbatch.")
+    parser.add_argument("--sbatch-dir", type=Path, default=None, help="Directory for generated sbatch scripts.")
+    parser.add_argument("--job-name", default="catalog")
+    parser.add_argument("--partition", default="shared,kill-shared")
+    parser.add_argument("--time", default="0-24:00:00")
+    parser.add_argument("--nodes", type=int, default=1)
+    parser.add_argument("--cpus-per-task", type=int, default=4)
+    parser.add_argument("--mem", default="64G")
+    parser.add_argument("--conda-env", default="stenv")
+    parser.add_argument("--git-pull", action="store_true", default=True)
+    parser.add_argument("--no-git-pull", action="store_false", dest="git_pull")
     return parser.parse_args()
 
 
@@ -72,10 +85,16 @@ def write_dither_table(path: Path, rows: List[dict]) -> None:
         writer.writerows(rows)
 
 
-def build_command(args: argparse.Namespace, row: dict, exposure_dir: Path, truth_dir: Path) -> List[str]:
+def build_command(
+    args: argparse.Namespace,
+    row: dict,
+    exposure_dir: Path,
+    truth_dir: Path,
+    python_executable: str = sys.executable,
+) -> List[str]:
     script = Path(__file__).with_name("romanisim_lightcone_simulator.py")
     command = [
-        sys.executable,
+        python_executable,
         str(script),
         *[str(path) for path in args.catalog],
         "--catalog-format",
@@ -136,6 +155,44 @@ def build_command(args: argparse.Namespace, row: dict, exposure_dir: Path, truth
     return command
 
 
+def shell_join(command: List[str]) -> str:
+    return " ".join(shlex.quote(part) for part in command)
+
+
+def write_sbatch_script(args: argparse.Namespace, row: dict, command: List[str]) -> Path:
+    sbatch_dir = args.sbatch_dir or (args.output_dir / "sbatch")
+    sbatch_dir.mkdir(parents=True, exist_ok=True)
+    script_path = sbatch_dir / f"exp{row['exposure']:04d}_sca{args.sca:02d}.sbatch"
+    log_prefix = args.output_dir / f"exp{row['exposure']:04d}" / "slurm"
+    script = [
+        "#!/bin/bash",
+        f"#SBATCH --job-name={args.job_name}_e{row['exposure']:04d}_s{args.sca:02d}",
+        f"#SBATCH --partition={args.partition}",
+        f"#SBATCH --time={args.time}",
+        f"#SBATCH --nodes={args.nodes}",
+        f"#SBATCH --cpus-per-task={args.cpus_per_task}",
+        f"#SBATCH --mem={args.mem}",
+        f"#SBATCH --error={log_prefix}-%A.err",
+        f"#SBATCH --output={log_prefix}-%A.out",
+        "",
+        "set -euo pipefail",
+        "",
+        f"source activate {shlex.quote(args.conda_env)}",
+    ]
+    if args.git_pull:
+        script.append("git pull")
+    script.extend(
+        [
+            "",
+            shell_join(command),
+            "",
+        ]
+    )
+    script_path.write_text("\n".join(script))
+    script_path.chmod(0o755)
+    return script_path
+
+
 def main() -> None:
     args = parse_args()
     rng = np.random.default_rng(args.seed)
@@ -165,8 +222,15 @@ def main() -> None:
     for row in rows:
         exposure_dir = args.output_dir / f"exp{row['exposure']:04d}"
         truth_dir = exposure_dir / "truth"
-        command = build_command(args, row, exposure_dir, truth_dir)
+        python_executable = "python" if (args.write_sbatch or args.submit) else sys.executable
+        command = build_command(args, row, exposure_dir, truth_dir, python_executable=python_executable)
         print(" ".join(command), flush=True)
+        if args.write_sbatch or args.submit:
+            script_path = write_sbatch_script(args, row, command)
+            print(f"Wrote {script_path}", flush=True)
+            if args.submit and not args.dry_run:
+                subprocess.run(["sbatch", str(script_path)], check=True)
+            continue
         if not args.dry_run:
             subprocess.run(command, check=True)
 

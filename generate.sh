@@ -1,0 +1,13 @@
+python romanisim_dither_sequence.py ../*/lightcone.dat \
+  --catalog-format lightcone \
+  --output-dir romanisim_dithers \
+  --base-ra 0.286019 \
+  --base-dec 0.638044 \
+  --filters Y106 \
+  --level 2 \
+  --render-mode achromatic \
+  --psf-mode achromatic \
+  --count-scale 140 \
+  --n-exposures 40 \
+  --write-sbatch \
+  --submit

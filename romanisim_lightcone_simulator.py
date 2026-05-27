@@ -48,6 +48,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--catalog-format", default="auto", choices=("auto", "csv", "table", "lightcone"))
     parser.add_argument("--output-dir", type=Path, default=Path("romanisim_output"))
     parser.add_argument("--truth-dir", type=Path, default=Path("romanisim_output/truth"))
+    parser.add_argument(
+        "--product-suffix",
+        default="",
+        help="Optional suffix inserted into Romanisim output filenames, e.g. exp0001.",
+    )
     parser.add_argument("--filters", nargs="+", default=["H158"])
     parser.add_argument("--sca", type=int, default=7)
     parser.add_argument("--pointing-ra", type=float, required=True)
@@ -260,7 +265,8 @@ def make_romanisim_product(args: argparse.Namespace, band: str, extra_counts: Pa
     romanisim_cli = shutil.which("romanisim-make-image")
 
     canonical = canonical_band_name(band)
-    output = args.output_dir / f"romanisim_l{args.level}_sca{args.sca:02d}_{canonical}.asdf"
+    suffix = f"_{args.product_suffix}" if args.product_suffix else ""
+    output = args.output_dir / f"romanisim_l{args.level}_sca{args.sca:02d}_{canonical}{suffix}.asdf"
     romanisim_args = [
         str(output),
         "--level",

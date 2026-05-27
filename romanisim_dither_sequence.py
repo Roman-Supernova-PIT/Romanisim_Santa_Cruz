@@ -140,6 +140,8 @@ def build_command(
         str(exposure_dir),
         "--truth-dir",
         str(truth_dir),
+        "--product-suffix",
+        f"exp{row['exposure']:04d}",
         "--filters",
         *args.filters,
         "--sca",
@@ -198,6 +200,7 @@ def shell_join(command: List[str]) -> str:
 
 def build_fits_conversion_commands(
     args: argparse.Namespace,
+    row: dict,
     exposure_dir: Path,
     python_executable: str = sys.executable,
 ) -> List[List[str]]:
@@ -208,8 +211,9 @@ def build_fits_conversion_commands(
     commands: List[List[str]] = []
     for band in args.filters:
         canonical = canonical_band_name(band)
-        asdf_path = exposure_dir / f"romanisim_l{args.level}_sca{args.sca:02d}_{canonical}.asdf"
-        fits_path = exposure_dir / f"romanisim_l{args.level}_sca{args.sca:02d}_{canonical}.fits"
+        suffix = f"exp{row['exposure']:04d}"
+        asdf_path = exposure_dir / f"romanisim_l{args.level}_sca{args.sca:02d}_{canonical}_{suffix}.asdf"
+        fits_path = exposure_dir / f"romanisim_l{args.level}_sca{args.sca:02d}_{canonical}_{suffix}.fits"
         command = [python_executable, str(script), str(asdf_path), str(fits_path)]
         if args.fits_all_slices:
             command.append("--all-slices")
@@ -282,7 +286,7 @@ def main() -> None:
         truth_dir = exposure_dir / "truth"
         python_executable = "python" if (args.write_sbatch or args.submit) else sys.executable
         command = build_command(args, row, exposure_dir, truth_dir, python_executable=python_executable)
-        commands = [command, *build_fits_conversion_commands(args, exposure_dir, python_executable=python_executable)]
+        commands = [command, *build_fits_conversion_commands(args, row, exposure_dir, python_executable=python_executable)]
         for planned_command in commands:
             print(" ".join(planned_command), flush=True)
         if args.write_sbatch or args.submit:

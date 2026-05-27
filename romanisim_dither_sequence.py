@@ -15,6 +15,31 @@ from typing import List, Tuple
 import numpy as np
 
 
+FILTER_ALIASES = {
+    "F062": "R062",
+    "R062": "R062",
+    "F087": "Z087",
+    "Z087": "Z087",
+    "F106": "Y106",
+    "Y106": "Y106",
+    "F129": "J129",
+    "J129": "J129",
+    "F146": "W146",
+    "W146": "W146",
+    "W149": "W146",
+    "F158": "H158",
+    "H158": "H158",
+    "F184": "F184",
+    "F213": "K213",
+    "K213": "K213",
+}
+
+
+def canonical_band_name(band: str) -> str:
+    normalized = band.strip().upper()
+    return FILTER_ALIASES.get(normalized, normalized)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate random dither/roll pointings and run romanisim_lightcone_simulator.py."
@@ -49,6 +74,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--psftype", choices=("epsf", "galsim", "stpsf"), default=None)
     parser.add_argument("--verbose-footprint", action="store_true")
     parser.add_argument("--no-progress", action="store_true")
+    parser.add_argument(
+        "--convert-fits",
+        action="store_true",
+        default=True,
+        help="Convert each Romanisim ASDF product to FITS after simulation.",
+    )
+    parser.add_argument("--no-convert-fits", action="store_false", dest="convert_fits")
+    parser.add_argument(
+        "--fits-all-slices",
+        action="store_true",
+        help="For L1 ASDF resultants, write every plane as a FITS extension.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Write the dither table and print commands without running them.")
     parser.add_argument("--write-sbatch", action="store_true", help="Write one Slurm sbatch script per exposure instead of running locally.")
     parser.add_argument("--submit", action="store_true", help="Submit generated sbatch scripts with sbatch.")
@@ -159,7 +196,28 @@ def shell_join(command: List[str]) -> str:
     return " ".join(shlex.quote(part) for part in command)
 
 
-def write_sbatch_script(args: argparse.Namespace, row: dict, command: List[str]) -> Path:
+def build_fits_conversion_commands(
+    args: argparse.Namespace,
+    exposure_dir: Path,
+    python_executable: str = sys.executable,
+) -> List[List[str]]:
+    if not args.convert_fits:
+        return []
+
+    script = Path(__file__).with_name("roman_asdf_to_fits.py")
+    commands: List[List[str]] = []
+    for band in args.filters:
+        canonical = canonical_band_name(band)
+        asdf_path = exposure_dir / f"romanisim_l{args.level}_sca{args.sca:02d}_{canonical}.asdf"
+        fits_path = exposure_dir / f"romanisim_l{args.level}_sca{args.sca:02d}_{canonical}.fits"
+        command = [python_executable, str(script), str(asdf_path), str(fits_path)]
+        if args.fits_all_slices:
+            command.append("--all-slices")
+        commands.append(command)
+    return commands
+
+
+def write_sbatch_script(args: argparse.Namespace, row: dict, commands: List[List[str]]) -> Path:
     sbatch_dir = args.sbatch_dir or (args.output_dir / "sbatch")
     sbatch_dir.mkdir(parents=True, exist_ok=True)
     script_path = sbatch_dir / f"exp{row['exposure']:04d}_sca{args.sca:02d}.sbatch"
@@ -184,7 +242,7 @@ def write_sbatch_script(args: argparse.Namespace, row: dict, command: List[str])
     script.extend(
         [
             "",
-            shell_join(command),
+            *[shell_join(command) for command in commands],
             "",
         ]
     )
@@ -224,15 +282,18 @@ def main() -> None:
         truth_dir = exposure_dir / "truth"
         python_executable = "python" if (args.write_sbatch or args.submit) else sys.executable
         command = build_command(args, row, exposure_dir, truth_dir, python_executable=python_executable)
-        print(" ".join(command), flush=True)
+        commands = [command, *build_fits_conversion_commands(args, exposure_dir, python_executable=python_executable)]
+        for planned_command in commands:
+            print(" ".join(planned_command), flush=True)
         if args.write_sbatch or args.submit:
-            script_path = write_sbatch_script(args, row, command)
+            script_path = write_sbatch_script(args, row, commands)
             print(f"Wrote {script_path}", flush=True)
             if args.submit and not args.dry_run:
                 subprocess.run(["sbatch", str(script_path)], check=True)
             continue
         if not args.dry_run:
-            subprocess.run(command, check=True)
+            for planned_command in commands:
+                subprocess.run(planned_command, check=True)
 
 
 if __name__ == "__main__":

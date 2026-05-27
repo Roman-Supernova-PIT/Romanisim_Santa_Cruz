@@ -64,6 +64,11 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Overwrite output FITS file.",
     )
+    parser.add_argument(
+        "--no-wcs",
+        action="store_true",
+        help="Do not try to translate ASDF GWCS metadata into FITS WCS keywords.",
+    )
     return parser.parse_args()
 
 
@@ -150,13 +155,46 @@ def output_path(input_path: Path, output: Optional[Path], array_name: str) -> Pa
     return input_path.with_name(f"{input_path.stem}_{suffix}.fits")
 
 
-def make_hdul(data: np.ndarray, source: Path, array_name: str, plane: Optional[int], all_slices: bool) -> fits.HDUList:
+def fits_wcs_header(model: Any, data_shape: tuple[int, ...]) -> fits.Header:
+    try:
+        wcs = getattr_path(model, "meta.wcs")
+    except (AttributeError, KeyError, TypeError):
+        return fits.Header()
+
+    if wcs is None or not hasattr(wcs, "to_fits_sip"):
+        return fits.Header()
+
+    ny, nx = data_shape[-2], data_shape[-1]
+    bounding_box = ((0, nx - 1), (0, ny - 1))
+    try:
+        return wcs.to_fits_sip(bounding_box=bounding_box)
+    except Exception as exc:
+        print(f"Warning: could not convert ASDF GWCS to FITS-SIP WCS: {exc}")
+        return fits.Header()
+
+
+def apply_wcs_header(hdu: fits.ImageHDU, wcs_header: fits.Header) -> None:
+    for key, value in wcs_header.items():
+        if key in {"SIMPLE", "BITPIX", "EXTEND", "NAXIS", "NAXIS1", "NAXIS2"}:
+            continue
+        hdu.header[key] = value
+
+
+def make_hdul(
+    data: np.ndarray,
+    source: Path,
+    array_name: str,
+    plane: Optional[int],
+    all_slices: bool,
+    wcs_header: fits.Header,
+) -> fits.HDUList:
     primary = fits.PrimaryHDU()
     primary.header["SRCASDF"] = str(source)
     primary.header["ARRNAME"] = array_name
 
     if data.ndim == 2:
         image = fits.ImageHDU(data=np.asarray(data), name=array_name.upper()[:8])
+        apply_wcs_header(image, wcs_header)
         return fits.HDUList([primary, image])
 
     if data.ndim != 3:
@@ -167,6 +205,7 @@ def make_hdul(data: np.ndarray, source: Path, array_name: str, plane: Optional[i
         for idx in range(data.shape[0]):
             hdu = fits.ImageHDU(data=np.asarray(data[idx]), name=f"SLICE{idx:03d}"[:8])
             hdu.header["PLANE"] = idx
+            apply_wcs_header(hdu, wcs_header)
             hdus.append(hdu)
         return fits.HDUList(hdus)
 
@@ -175,6 +214,7 @@ def make_hdul(data: np.ndarray, source: Path, array_name: str, plane: Optional[i
     image = fits.ImageHDU(data=np.asarray(data[plane]), name=array_name.upper()[:8])
     image.header["PLANE"] = plane
     image.header["NPLANE"] = data.shape[0]
+    apply_wcs_header(image, wcs_header)
     return fits.HDUList([primary, image])
 
 
@@ -192,7 +232,8 @@ def main() -> None:
         data = np.asarray(value)
         output = output_path(args.input, args.output, array_name)
         output.parent.mkdir(parents=True, exist_ok=True)
-        hdul = make_hdul(data, args.input, array_name, args.slice, args.all_slices)
+        wcs_header = fits.Header() if args.no_wcs else fits_wcs_header(model, data.shape)
+        hdul = make_hdul(data, args.input, array_name, args.slice, args.all_slices, wcs_header)
         hdul.writeto(output, overwrite=args.overwrite)
         print(f"Wrote {output} from {array_name} shape={data.shape}")
     finally:

@@ -13,6 +13,11 @@ import numpy as np
 from astropy.io import fits
 from astropy.wcs import WCS
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - exercised only when tqdm is absent.
+    tqdm = None
+
 
 @dataclass
 class InputInfo:
@@ -45,6 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fill-value", type=parse_fill_value, default=np.nan)
     parser.add_argument("--make-count-map", action="store_true")
     parser.add_argument("--make-weight-map", action="store_true")
+    parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars.")
     parser.add_argument(
         "--chunk-size",
         type=int,
@@ -166,6 +172,7 @@ def drizzle_point_kernel(
     weight_key: Optional[str] = None,
     fill_value: float = np.nan,
     chunk_size: int = 1_000_000,
+    show_progress: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive.")
@@ -174,46 +181,63 @@ def drizzle_point_kernel(
     numerator = np.zeros(output_shape, dtype=float)
     denominator = np.zeros(output_shape, dtype=float)
     count = np.zeros(output_shape, dtype=np.int64)
-
-    for info in input_infos:
-        data = info.data
-        finite = np.isfinite(data)
+    progress_bar = None
+    if show_progress and tqdm is not None:
+        total = 0
         if weight_mode == "uniform":
-            weights = np.ones_like(data, dtype=float)
-        elif weight_mode == "ivar":
-            weights = load_weight_image(info.filename, weight_key=weight_key)
-            if weights.shape != data.shape:
-                raise ValueError(
-                    f"Weight image for {info.filename} has shape {weights.shape}, expected {data.shape}."
-                )
-            finite &= np.isfinite(weights) & (weights > 0)
-        else:
-            raise ValueError(f"Unsupported weight mode {weight_mode!r}.")
+            total = sum(int(np.count_nonzero(np.isfinite(info.data))) for info in input_infos)
+        progress_bar = tqdm(total=total, desc="Drizzling", unit="pix")
 
-        ypix, xpix = np.nonzero(finite)
-        if len(xpix) == 0:
-            continue
+    try:
+        for info in input_infos:
+            data = info.data
+            finite = np.isfinite(data)
+            if weight_mode == "uniform":
+                weights = np.ones_like(data, dtype=float)
+            elif weight_mode == "ivar":
+                weights = load_weight_image(info.filename, weight_key=weight_key)
+                if weights.shape != data.shape:
+                    raise ValueError(
+                        f"Weight image for {info.filename} has shape {weights.shape}, expected {data.shape}."
+                    )
+                finite &= np.isfinite(weights) & (weights > 0)
+            else:
+                raise ValueError(f"Unsupported weight mode {weight_mode!r}.")
 
-        for start in range(0, len(xpix), chunk_size):
-            stop = min(start + chunk_size, len(xpix))
-            xchunk = xpix[start:stop]
-            ychunk = ypix[start:stop]
-
-            sky = info.wcs.pixel_to_world(xchunk.astype(float), ychunk.astype(float))
-            xout, yout = output_wcs.world_to_pixel(sky)
-            xround = np.rint(xout).astype(np.int64)
-            yround = np.rint(yout).astype(np.int64)
-            inside = (xround >= 0) & (xround < nx_out) & (yround >= 0) & (yround < ny_out)
-            if not np.any(inside):
+            ypix, xpix = np.nonzero(finite)
+            if progress_bar is not None:
+                if weight_mode != "uniform":
+                    progress_bar.total += len(xpix)
+                progress_bar.set_postfix_str(info.filename.name)
+                progress_bar.refresh()
+            if len(xpix) == 0:
                 continue
 
-            xo = xround[inside]
-            yo = yround[inside]
-            vals = data[ychunk[inside], xchunk[inside]]
-            w = weights[ychunk[inside], xchunk[inside]]
-            np.add.at(numerator, (yo, xo), w * vals)
-            np.add.at(denominator, (yo, xo), w)
-            np.add.at(count, (yo, xo), 1)
+            for start in range(0, len(xpix), chunk_size):
+                stop = min(start + chunk_size, len(xpix))
+                xchunk = xpix[start:stop]
+                ychunk = ypix[start:stop]
+
+                sky = info.wcs.pixel_to_world(xchunk.astype(float), ychunk.astype(float))
+                xout, yout = output_wcs.world_to_pixel(sky)
+                xround = np.rint(xout).astype(np.int64)
+                yround = np.rint(yout).astype(np.int64)
+                inside = (xround >= 0) & (xround < nx_out) & (yround >= 0) & (yround < ny_out)
+
+                if np.any(inside):
+                    xo = xround[inside]
+                    yo = yround[inside]
+                    vals = data[ychunk[inside], xchunk[inside]]
+                    w = weights[ychunk[inside], xchunk[inside]]
+                    np.add.at(numerator, (yo, xo), w * vals)
+                    np.add.at(denominator, (yo, xo), w)
+                    np.add.at(count, (yo, xo), 1)
+
+                if progress_bar is not None:
+                    progress_bar.update(stop - start)
+    finally:
+        if progress_bar is not None:
+            progress_bar.close()
 
     output = np.full(output_shape, fill_value, dtype=float)
     populated = denominator > 0
@@ -253,7 +277,7 @@ def make_test_wcs(ra: float, dec: float, xshift: float = 0.0, yshift: float = 0.
     return wcs
 
 
-def run_self_test() -> None:
+def run_self_test(show_progress: bool = True) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         inputs: list[Path] = []
@@ -266,7 +290,7 @@ def run_self_test() -> None:
 
         infos = [read_image_and_wcs(path) for path in inputs]
         out_wcs, out_shape = make_output_wcs_and_shape(infos, oversample=2)
-        image, count, weight = drizzle_point_kernel(infos, out_wcs, out_shape)
+        image, count, weight = drizzle_point_kernel(infos, out_wcs, out_shape, show_progress=show_progress)
         output = Path("drizzle_self_test_output.fits")
         write_output(
             output,
@@ -292,7 +316,7 @@ def run_self_test() -> None:
 def main() -> None:
     args = parse_args()
     if args.self_test:
-        run_self_test()
+        run_self_test(show_progress=not args.no_progress)
         return
 
     if not args.inputs:
@@ -310,6 +334,7 @@ def main() -> None:
         weight_key=args.weight_key,
         fill_value=args.fill_value,
         chunk_size=args.chunk_size,
+        show_progress=not args.no_progress,
     )
     write_output(
         args.output,
